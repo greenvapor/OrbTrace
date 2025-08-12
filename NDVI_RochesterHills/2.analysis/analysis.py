@@ -1,98 +1,115 @@
-import rasterio
+import ee
+import streamlit as st
+import datetime
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-import os
+import folium
+from streamlit_folium import st_folium
+import json
 
-# NDVI file paths
-script_dir = os.path.dirname(os.path.abspath(__file__))
-ndvi_2020_path = os.path.join(script_dir, '../1.data/NDVI_Rochester_2020.tif')
-ndvi_2024_path = os.path.join(script_dir, '../1.data/NDVI_Rochester_2024.tif')
+# --- GEE Authentication ---
+service_account = st.secrets["GEE_SERVICE_ACCOUNT"]
+key_json_str = st.secrets["GEE_KEY_JSON"]  # JSON string
+key_dict = json.loads(key_json_str)  # Convert to dict
 
-# Function to read NDVI data
-def load_ndvi(path):
-    with rasterio.open(path) as src:
-        ndvi = src.read(1)
-        ndvi = np.where((ndvi >= -1) & (ndvi <= 1), ndvi, np.nan)
-        return ndvi
+credentials = ee.ServiceAccountCredentials(service_account, key_dict)
+ee.Initialize(credentials)
 
-# Load data
-ndvi_2020 = load_ndvi(ndvi_2020_path)
-ndvi_2024 = load_ndvi(ndvi_2024_path)
+st.title("Yearly Satellite Image NDVI Viewer")
 
-# Calculate NDVI change
-ndvi_diff = ndvi_2024 - ndvi_2020
+# Location (Rochester Hills)
+location = ee.Geometry.Point(-83.141, 42.658)
 
-# === Statistical Analysis ===
-valid_mask = ~np.isnan(ndvi_diff)
-valid_diff = ndvi_diff[valid_mask]
+# Year selection UI
+current_year = datetime.datetime.now().year
+years = st.multiselect(
+    "Select years to compare NDVI",
+    options=list(range(2015, current_year + 1)),
+    default=[2020, 2021]
+)
 
-mean_change = np.nanmean(valid_diff)
-min_change = np.nanmin(valid_diff)
-max_change = np.nanmax(valid_diff)
+if not years:
+    st.warning("Please select at least one year.")
+    st.stop()
 
-increase_mask = valid_diff > 0
-decrease_mask = valid_diff < 0
+# --- Function: Calculate NDVI ---
+def get_yearly_ndvi(year):
+    start_date = f"{year}-01-01"
+    end_date = f"{year}-12-31"
+    collection = (
+        ee.ImageCollection('COPERNICUS/S2_SR')
+        .filterDate(start_date, end_date)
+        .filterBounds(location)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+        .select(['B4', 'B8'])
+    )
 
-increase_count = np.sum(increase_mask)
-decrease_count = np.sum(decrease_mask)
-total_count = increase_count + decrease_count
+    if collection.size().getInfo() == 0:
+        return None
 
-increase_ratio = (increase_count / total_count) * 100
-decrease_ratio = (decrease_count / total_count) * 100
+    image = collection.median()
+    ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+    return ndvi
 
-print("=== NDVI Change Statistics (2024 - 2020) ===")
-print(f"Mean change: {mean_change:.4f}")
-print(f"Min change: {min_change:.4f}")
-print(f"Max change: {max_change:.4f}")
-print(f"Increase count: {increase_count} pixels ({increase_ratio:.2f}%)")
-print(f"Decrease count: {decrease_count} pixels ({decrease_ratio:.2f}%)")
+# --- Function: Calculate mean NDVI ---
+def get_mean_ndvi(ndvi_image, geometry):
+    if ndvi_image is None:
+        return np.nan
+    stats = ndvi_image.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=geometry,
+        scale=10,
+        maxPixels=1e9
+    )
+    mean_val = stats.get('NDVI').getInfo()
+    return mean_val if mean_val is not None else np.nan
 
-# Visualization
-plt.figure(figsize=(6, 5))
-plt.imshow(ndvi_2020, cmap='YlGn', vmin=0, vmax=1)
-plt.title("NDVI 2020")
-plt.colorbar()
-plt.tight_layout()
+# --- Data collection ---
+mean_ndvi_values = []
+ndvi_images = {}
 
+for y in years:
+    ndvi_img = get_yearly_ndvi(y)
+    mean_val = get_mean_ndvi(ndvi_img, location)
+    mean_ndvi_values.append({'year': y, 'mean_ndvi': mean_val})
+    ndvi_images[y] = ndvi_img
 
-plt.figure(figsize=(6, 5))
-plt.imshow(ndvi_2024, cmap='YlGn', vmin=0, vmax=1)
-plt.title("NDVI 2024")
-plt.colorbar()
-plt.tight_layout()
+df_ndvi = pd.DataFrame(mean_ndvi_values).sort_values('year')
 
+# --- Plot the NDVI trend ---
+st.subheader("NDVI Mean Values Over Selected Years")
+fig, ax = plt.subplots()
+ax.plot(df_ndvi['year'], df_ndvi['mean_ndvi'], marker='o', linestyle='-', color='green')
+ax.set_xlabel("Year")
+ax.set_ylabel("Mean NDVI")
+ax.set_title("Yearly Mean NDVI Trend")
+ax.grid(True)
+st.pyplot(fig)
 
-plt.figure(figsize=(6, 5))
-plt.imshow(ndvi_diff, cmap='bwr', vmin=-0.5, vmax=0.5)
-plt.title("NDVI Difference (2024 - 2020)")
-plt.colorbar()
-plt.tight_layout()
-plt.show()
+# --- Display NDVI map ---
+selected_map_year = st.selectbox("Select year for NDVI map visualization", years)
+selected_ndvi_img = ndvi_images.get(selected_map_year)
 
-# Create directory for saving images if it doesn't exist
-os.makedirs("../3.report", exist_ok=True)
+if selected_ndvi_img is not None:
+    ndvi_params = {
+        'min': 0.0,
+        'max': 1.0,
+        'palette': ['white', 'yellowgreen', 'green']
+    }
+    map_id_dict = selected_ndvi_img.getMapId(ndvi_params)
+    tile_url = map_id_dict['tile_fetcher'].url_format
 
-# Save 
-plt.figure(figsize=(6, 5))
-plt.imshow(ndvi_2020, cmap='YlGn', vmin=0, vmax=1)
-plt.title("NDVI 2020")
-plt.colorbar()
-plt.tight_layout()
-plt.savefig("../3.report/ndvi_2020.png", dpi=150)
-plt.close()
+    m = folium.Map(location=[42.658, -83.141], zoom_start=11)
+    folium.TileLayer(
+        tiles=tile_url,
+        attr='Google Earth Engine',
+        name=f'NDVI {selected_map_year}',
+        overlay=True,
+        control=True
+    ).add_to(m)
 
-plt.figure(figsize=(6, 5))
-plt.imshow(ndvi_2024, cmap='YlGn', vmin=0, vmax=1)
-plt.title("NDVI 2024")
-plt.colorbar()
-plt.tight_layout()
-plt.savefig("../3.report/ndvi_2024.png", dpi=150)
-plt.close()
-
-plt.figure(figsize=(6, 5))
-plt.imshow(ndvi_diff, cmap='bwr', vmin=-0.5, vmax=0.5)
-plt.title("NDVI Difference (2024 - 2020)")
-plt.colorbar()
-plt.tight_layout()
-plt.savefig("../3.report/ndvi_diff.png", dpi=150)
-plt.close()
+    st.subheader(f"NDVI Map for {selected_map_year}")
+    st_folium(m, width=700, height=500)
+else:
+    st.warning(f"No valid Sentinel-2 data available for year {selected_map_year}.")
